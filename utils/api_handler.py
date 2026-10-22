@@ -14,21 +14,26 @@ from utils.db_connection import get_engine, execute_query, execute_non_query
 
 load_dotenv()
 
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
-RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "cricbuzz-cricket.p.rapidapi.com").strip()
-BASE_URL = f"https://{RAPIDAPI_HOST}"
+def get_rapidapi_credentials() -> tuple[str, str]:
+    """Dynamically reads credentials from .env to support real-time user updates."""
+    load_dotenv(override=True)
+    key = os.getenv("RAPIDAPI_KEY", "").strip()
+    host = os.getenv("RAPIDAPI_HOST", "cricbuzz-cricket.p.rapidapi.com").strip()
+    return key, host
 
 def get_headers() -> Dict[str, str]:
     """Generates authentication headers for Cricbuzz RapidAPI."""
+    key, host = get_rapidapi_credentials()
     return {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-key": key,
+        "x-rapidapi-host": host,
         "Content-Type": "application/json"
     }
 
 def has_valid_api_key() -> bool:
     """Checks if a non-placeholder RapidAPI key is configured."""
-    return bool(RAPIDAPI_KEY and RAPIDAPI_KEY != "your_rapidapi_key_here")
+    key, _ = get_rapidapi_credentials()
+    return bool(key and key != "your_rapidapi_key_here")
 
 # =====================================================================
 # SIMULATED LIVE DATA ENGINE (FOR SEAMLESS TESTING & DEMONSTRATIONS)
@@ -130,66 +135,115 @@ SIMULATED_LIVE_MATCHES = [
 # API CALL IMPLEMENTATIONS WITH AUTOMATIC FALLBACK
 # =====================================================================
 
-def get_live_matches() -> List[Dict[str, Any]]:
+# =====================================================================
+# IN-MEMORY RATE-LIMIT PROTECTION CACHE (PREVENTS RAPIDAPI QUOTA EXHAUSTION)
+# =====================================================================
+_API_CACHE = {
+    "live_matches": None,
+    "live_matches_time": 0.0,
+    "match_details": {},
+    "match_details_time": {},
+}
+
+def get_live_matches(force_refresh: bool = False) -> List[Dict[str, Any]]:
     """
     Fetches ongoing live cricket matches from Cricbuzz API.
-    Falls back to high-fidelity live simulation when API key is missing or quota is reached.
+    Uses a 60-second in-memory cache to preserve RapidAPI free-tier rate limits.
+    Falls back to simulation when API key is missing or quota is reached.
     """
+    now = time.time()
+    if not force_refresh and _API_CACHE["live_matches"] and (now - _API_CACHE["live_matches_time"] < 60):
+        return _API_CACHE["live_matches"]
+
     if has_valid_api_key():
-        try:
-            url = f"{BASE_URL}/matches/v1/live"
-            response = requests.get(url, headers=get_headers(), timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                matches = _parse_cricbuzz_live_list(data)
-                if matches:
-                    return matches
-        except Exception as e:
-            print(f"Cricbuzz live API error (using fallback): {e}")
+        _, host = get_rapidapi_credentials()
+        base_url = f"https://{host}"
+        
+        # Support both RapidAPI URL variations (/matches/live and /matches/v1/live)
+        for path in ["/matches/live", "/matches/v1/live"]:
+            try:
+                url = f"{base_url}{path}"
+                response = requests.get(url, headers=get_headers(), timeout=6)
+                if response.status_code == 200:
+                    data = response.json()
+                    matches = _parse_cricbuzz_live_list(data)
+                    if matches:
+                        _API_CACHE["live_matches"] = matches
+                        _API_CACHE["live_matches_time"] = now
+                        return matches
+            except Exception as e:
+                print(f"Cricbuzz live API error on {path}: {e}")
 
     # Fallback simulation
     return SIMULATED_LIVE_MATCHES
 
 def get_match_details(match_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves full match scorecard and status for a given match ID."""
+    """
+    Retrieves full match scorecard and in-play telemetry for a given match ID.
+    Enriches base live match data with miniscore (striker, bowler, CRR/RRR) and commentary.
+    Uses 30-second cache to prevent quota exhaustion.
+    """
     # Check simulation matches first
     for m in SIMULATED_LIVE_MATCHES:
         if str(m["id"]) == str(match_id):
             return m
 
-    if has_valid_api_key():
-        try:
-            url = f"{BASE_URL}/mcenter/v1/{match_id}/scard"
-            response = requests.get(url, headers=get_headers(), timeout=5)
-            if response.status_code == 200:
-                return _parse_cricbuzz_scorecard(response.json(), match_id)
-        except Exception as e:
-            print(f"Cricbuzz scorecard API error: {e}")
+    now = time.time()
+    if match_id in _API_CACHE["match_details"]:
+        last_t = _API_CACHE["match_details_time"].get(match_id, 0.0)
+        if now - last_t < 30:
+            return _API_CACHE["match_details"][match_id]
 
-    return None
+    # Find base match info from live matches list
+    live_list = get_live_matches()
+    base_match = None
+    for m in live_list:
+        if str(m.get("id")) == str(match_id):
+            base_match = dict(m)
+            break
+
+    if not base_match:
+        base_match = {
+            "id": match_id,
+            "description": "Cricket Match",
+            "series": "International Series",
+            "format": "T20",
+            "status": "In Progress",
+            "venue": "Cricket Ground",
+            "toss": "",
+            "team1": {"name": "Team 1", "code": "T1", "score": "-", "overs": "-"},
+            "team2": {"name": "Team 2", "code": "T2", "score": "-", "overs": "-"},
+            "current_state": None,
+            "commentary": []
+        }
+
+    if has_valid_api_key():
+        _, host = get_rapidapi_credentials()
+        base_url = f"https://{host}"
+        
+        # Pull live telemetry & commentary from /mcenter/v1/{match_id}/comm
+        for path in [f"/mcenter/v1/{match_id}/comm", f"/mcenter/{match_id}/comm"]:
+            try:
+                url = f"{base_url}{path}"
+                response = requests.get(url, headers=get_headers(), timeout=6)
+                if response.status_code == 200:
+                    comm_data = response.json()
+                    enriched = _enrich_match_with_miniscore(base_match, comm_data)
+                    _API_CACHE["match_details"][match_id] = enriched
+                    _API_CACHE["match_details_time"][match_id] = now
+                    return enriched
+            except Exception as e:
+                print(f"Error fetching match telemetry for {match_id}: {e}")
+
+    _API_CACHE["match_details"][match_id] = base_match
+    _API_CACHE["match_details_time"][match_id] = now
+    return base_match
 
 def get_match_commentary(match_id: str) -> List[Dict[str, Any]]:
     """Fetches real-time commentary lines for an active match."""
-    for m in SIMULATED_LIVE_MATCHES:
-        if str(m["id"]) == str(match_id):
-            return m.get("commentary", [])
-
-    if has_valid_api_key():
-        try:
-            url = f"{BASE_URL}/mcenter/v1/{match_id}/comm"
-            response = requests.get(url, headers=get_headers(), timeout=5)
-            if response.status_code == 200:
-                comm_data = response.json()
-                lines = []
-                for c in comm_data.get("commentaryList", [])[:10]:
-                    lines.append({
-                        "over": str(c.get("overNumber", "")),
-                        "text": c.get("commText", "")
-                    })
-                return lines
-        except Exception as e:
-            print(f"Cricbuzz commentary API error: {e}")
-
+    match = get_match_details(match_id)
+    if match:
+        return match.get("commentary", [])
     return []
 
 def get_top_player_leaderboards(category: str = "batting", cricket_format: str = "ODI") -> List[Dict[str, Any]]:
@@ -332,18 +386,79 @@ def _parse_cricbuzz_live_list(data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 })
     return results
 
-def _parse_cricbuzz_scorecard(data: Dict[str, Any], match_id: str) -> Dict[str, Any]:
-    """Transforms raw scorecard JSON into structured match details."""
-    return {
-        "id": match_id,
-        "description": data.get("matchHeader", {}).get("matchDescription", "International Match"),
-        "series": data.get("matchHeader", {}).get("seriesName", ""),
-        "format": data.get("matchHeader", {}).get("matchFormat", "ODI"),
-        "status": data.get("status", "Completed"),
-        "venue": data.get("venueInfo", {}).get("ground", ""),
-        "toss": data.get("tossResults", {}).get("tossWinnerName", ""),
-        "team1": {"name": "Team 1", "score": "-", "overs": "-"},
-        "team2": {"name": "Team 2", "score": "-", "overs": "-"},
-        "current_state": None,
-        "commentary": []
-    }
+def _enrich_match_with_miniscore(base_match: Dict[str, Any], comm_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Enriches a base match dictionary with real-time in-play telemetry and commentary from comm API."""
+    enriched = dict(base_match)
+    ms = comm_data.get("miniscore", {})
+    
+    if ms:
+        bs = ms.get("batsmanstriker", {})
+        bns = ms.get("batsmannonstriker", {})
+        bw = ms.get("bowlerstriker", {})
+        
+        batters = []
+        if bs and bs.get("batname"):
+            batters.append({
+                "name": bs.get("batname"),
+                "runs": int(bs.get("batruns", 0)),
+                "balls": int(bs.get("batballs", 0)),
+                "fours": int(bs.get("batfours", 0)),
+                "sixes": int(bs.get("batsixes", 0)),
+                "sr": float(bs.get("batstrike_rate", 0.0) or 0.0),
+                "on_strike": True
+            })
+        if bns and bns.get("batname"):
+            batters.append({
+                "name": bns.get("batname"),
+                "runs": int(bns.get("batruns", 0)),
+                "balls": int(bns.get("batballs", 0)),
+                "fours": int(bns.get("batfours", 0)),
+                "sixes": int(bns.get("batsixes", 0)),
+                "sr": float(bns.get("batstrike_rate", 0.0) or 0.0),
+                "on_strike": False
+            })
+            
+        bowler = {}
+        if bw and bw.get("bowlname"):
+            bowler = {
+                "name": bw.get("bowlname"),
+                "overs": str(bw.get("bowlovers", "0.0")),
+                "maidens": int(bw.get("bowlmaidens", 0)),
+                "runs": int(bw.get("bowlruns", 0)),
+                "wickets": int(bw.get("bowlwickets", 0)),
+                "econ": float(bw.get("bowlecon", 0.0) or 0.0)
+            }
+            
+        recent_overs_raw = ms.get("curovsstats", "")
+        recent_overs = [b for b in recent_overs_raw.split() if b] if recent_overs_raw else []
+        
+        if batters or bowler:
+            enriched["current_state"] = {
+                "batting_team": enriched["team1"]["name"],
+                "required_runs": ms.get("target"),
+                "balls_remaining": ms.get("ballsrem"),
+                "crr": float(ms.get("crr", 0.0) or 0.0),
+                "rrr": float(ms.get("rrr", 0.0) or 0.0) if ms.get("rrr") else None,
+                "batters": batters,
+                "bowler": bowler,
+                "recent_overs": recent_overs
+            }
+            
+        if ms.get("custstatus"):
+            enriched["status"] = ms.get("custstatus")
+
+    # Commentary Lines
+    comwrapper = comm_data.get("comwrapper", [])
+    commentary = []
+    for item in comwrapper[:15]:
+        c = item.get("commentary", {})
+        if c.get("commtxt"):
+            commentary.append({
+                "over": str(c.get("overnum", "")),
+                "text": c.get("commtxt")
+            })
+            
+    if commentary:
+        enriched["commentary"] = commentary
+
+    return enriched
