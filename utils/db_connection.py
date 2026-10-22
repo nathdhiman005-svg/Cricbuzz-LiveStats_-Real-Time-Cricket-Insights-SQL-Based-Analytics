@@ -190,7 +190,14 @@ def get_database_url() -> str:
     Falls back to local SQLite if not configured.
     """
     raw_url = os.getenv("DATABASE_URL", "").strip()
-    
+    if not raw_url:
+        try:
+            import streamlit as st
+            if "DATABASE_URL" in st.secrets:
+                raw_url = str(st.secrets["DATABASE_URL"]).strip()
+        except Exception:
+            pass
+            
     if not raw_url:
         sqlite_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cricbuzz.db")
         return f"sqlite:///{sqlite_path}"

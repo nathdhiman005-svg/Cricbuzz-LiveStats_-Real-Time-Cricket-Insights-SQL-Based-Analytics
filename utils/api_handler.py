@@ -19,6 +19,15 @@ def get_rapidapi_credentials() -> tuple[str, str]:
     load_dotenv(override=True)
     key = os.getenv("RAPIDAPI_KEY", "").strip()
     host = os.getenv("RAPIDAPI_HOST", "cricbuzz-cricket.p.rapidapi.com").strip()
+    if not key:
+        try:
+            import streamlit as st
+            if "RAPIDAPI_KEY" in st.secrets:
+                key = str(st.secrets["RAPIDAPI_KEY"]).strip()
+            if "RAPIDAPI_HOST" in st.secrets:
+                host = str(st.secrets["RAPIDAPI_HOST"]).strip()
+        except Exception:
+            pass
     return key, host
 
 def get_headers() -> Dict[str, str]:
